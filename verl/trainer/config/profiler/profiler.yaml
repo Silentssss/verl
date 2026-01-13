@@ -62,6 +62,9 @@ tool_config:
     # manual save
     manual_save: True
 
+    # True for each task has its own database, False for all tasks in one training step share one database.
+    discrete: False
+
     name: torch
 
   torch_memory:

@@ -14,178 +14,204 @@
 
 import functools
 import os
-from typing import Callable, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Optional
 
 import torch
-import torch.distributed
+from torch.cuda import nvtx
 
 from ..memory_utils import MemorySnapshotSampler, enable_memory_visualize
 from .config import ProfilerConfig, TorchMemoryToolConfig, TorchProfilerToolConfig
+from .profile import DistProfiler
 
-
-class Profiler:
-    """A PyTorch profiler wrapper class for collecting performance metrics.
-
-    TODO(haibin.lin): this should implement the DistProfiler interface, and the config should be unified.
-
-    This profiler provides a convenient interface for profiling PyTorch operations,
-    with support for:
-
-    - CPU and CUDA activity profiling
-    - Configurable profiling schedule (wait/warmup/active steps)
-    - Multi-rank profiling support
-    - Chrome trace export
+def mark_start_range(message: Optional[str] = None) -> None:
+    """Start a mark range in the profiler.
 
     Args:
-        config: Configuration object containing profiling parameters
+        message (str, optional):
+            The message to be displayed in the profiler. Defaults to None.
     """
-
-    def __init__(
-        self, config: ProfilerConfig, tool_config: Optional[TorchProfilerToolConfig] = None, save_file_prefix=None
-    ):
-        # note : if we do not set use_profile, it will be set as None, so that all function will be skip
-        if not config:
-            config = ProfilerConfig(ranks=[], enable=False)
-
-        self.save_file_prefix = save_file_prefix
-
-        if not tool_config:
-            assert not config.enable, "tool_config must be provided when profiler is enabled"
-        self.prof = None
-        self.saved = False
-        self.enable = config.enable
-        if not config.enable:
-            return
-        self.config = config
-        self.tool_config = tool_config
-        self.rank = torch.distributed.get_rank()
-        # we need to validate the config before using the profiler
-        self._validate()
-
-        if self.rank in self.config.ranks or self.config.all_ranks:
-            print(f"[Profiler] Profiler init for rank {self.rank}")
-
-            self.prof = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                schedule=torch.profiler.schedule(
-                    wait=max(self.tool_config.step_start - 1, 0),
-                    warmup=1 if self.tool_config.step_start > 0 else 0,
-                    active=self.tool_config.step_end - self.tool_config.step_start,
-                    repeat=1,
-                ),
-                record_shapes=True,
-                with_stack=True,
-            )
-
-    def _trace_handler(self, prof):
-        if not os.path.exists(self.config.save_path):
-            os.makedirs(self.config.save_path)
-
-        save_file_name = f"prof_rank-{self.rank}.json.gz"
-        if self.save_file_prefix is not None:
-            save_file_name = self.save_file_prefix + "_" + save_file_name
-        save_path = os.path.join(self.config.save_path, save_file_name)
-        print(f"[Profiler] Saving trace to {save_path}")
-        prof.export_chrome_trace(save_path)
-        self.enable = False
-        self.saved = True
-
-    def _validate(self):
-        if self.enable:
-            if self.config.ranks is None:
-                print("[WARNING] Profile ranks is not set, default to rank 0")
-                self.config.ranks = [0]
-            assert self.tool_config.step_start >= 0, "[ERROR] Profile step start must be greater than 0"
-            assert self.tool_config.step_end >= 0, "[ERROR] Profile step end must be greater than 0"
-            assert self.tool_config.step_start < self.tool_config.step_end, (
-                "[ERROR] Profile step start must be less than step end"
-            )
-
-    def check(self):
-        return self.prof is not None and self.enable
-
-    def start(self):
-        if self.check():
-            print(f"[Profiler] started for rank {self.rank}")
-            self.prof.start()
-
-    def step(self):
-        if self.check():
-            self.prof.step()
-
-    def stop(self):
-        if self.check():
-            self.step()
-            print(f"[Profiler] stopped for rank {self.rank}")
-            self.prof.stop()
-            self.save()
-
-    def save(self):
-        if self.prof is not None and not self.saved and self.tool_config.manual_save:
-            self._trace_handler(prof=self.prof)
-
-    def stop_and_save(self):
-        if self.check():
-            self.stop()
-            self.save()
-
-    def stop_trace(self):
-        if self.check():
-            print(f"[Profiler] Trace stopped for rank {self.rank}")
-            self.enable = False
-
-
-def mark_start_range(
-    message: Optional[str] = None,
-    color: Optional[str] = None,
-    domain: Optional[str] = None,
-    category: Optional[str] = None,
-) -> None:
-    """Start a profiling range marker (no-op implementation).
-
-    Args:
-        message (Optional[str]): Message to associate with the range marker.
-        color (Optional[str]): Color for the marker visualization.
-        domain (Optional[str]): Domain for the marker.
-        category (Optional[str]): Category for the marker.
-    """
-    pass
+    return nvtx.range_start(message=message)
 
 
 def mark_end_range(range_id: str) -> None:
-    """End a profiling range marker (no-op implementation).
+    """End a mark range in the profiler.
 
     Args:
-        range_id (str): Identifier of the range to end.
+        range_id (str):
+            The id of the mark range to end.
     """
-    pass
+    return nvtx.range_end(range_id)
 
 
-def mark_annotate(
-    message: Optional[str] = None,
-    color: Optional[str] = None,
-    domain: Optional[str] = None,
-    category: Optional[str] = None,
-) -> Callable:
-    """Decorator to annotate a function with profiling markers (no-op implementation).
+def mark_annotate(message: Optional[str] = None) -> Callable:
+    """Decorate a function to annotate a mark range along with the function life cycle.
 
     Args:
-        message (Optional[str]): Message to associate with the annotation.
-        color (Optional[str]): Color for the marker visualization.
-        domain (Optional[str]): Domain for the marker.
-        category (Optional[str]): Category for the marker.
-
-    Returns:
-        Callable: Decorator function that returns the original function unchanged.
+        message (str, optional):
+            The message to be displayed in the profiler. Defaults to None.
     """
 
     def decorator(func):
         return func
 
     return decorator
+
+
+@contextmanager
+def marked_timer(
+    name: str, 
+    timing_raw: dict[str, float], 
+    *args: Any, 
+    **kwargs: Any,
+):
+    """Context manager for timing with NVTX markers.
+
+    This utility function measures the execution time of code within its context,
+    accumulates the timing information, and adds MSTX markers for profiling.
+
+    Args:
+        name (str): The name/identifier for this timing measurement.
+        timing_raw (Dict[str, float]): Dictionary to store timing information.
+
+    Yields:
+        None: This is a context manager that yields control back to the code block.
+    """
+    mark_range = mark_start_range(message=name)
+    from verl.utils.profiler.performance import _timer
+
+    yield from _timer(name, timing_raw)
+    mark_end_range(mark_range)
+
+
+def get_torch_profiler(
+    profile_save_path: str,
+    role: Optional[str] = None,
+    profile_step: Optional[str] = None,
+):
+    """Generate and return a Torch profiler object.
+
+    Args:
+        profile_save_path (str):
+            The path to save the collected data.
+        role (str, optional):
+            The role of the current data collection. Defaults to None.
+        profile_step(str, optional):
+            The current training step. Defaults to None.
+    """
+    if profile_step:
+        profile_save_path = os.path.join(profile_save_path, profile_step)
+    if role:
+        profile_save_path = os.path.join(profile_save_path, role)
+
+    profile = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_save_path, use_gzip=True),
+            record_shapes=True,
+            with_stack=True,
+        )
+
+    return profile
+
+
+class TorchProfiler(DistProfiler):
+    """Torch profiler. Installed in a worker to control the Torch profiler."""
+
+    _define_count = 0
+
+    def __init__(self, rank: int, config: ProfilerConfig, tool_config: Optional[TorchProfilerToolConfig], **kwargs):
+        """Initialize the TorchProfiler.
+
+        Args:
+            rank (int): The rank of the current process.
+            config (Optional[ProfilerConfig]): Configuration for the profiler. If None, a default configuration is used.
+        """
+        # If no configuration is provided, create a default ProfilerConfig with an empty list of ranks
+        if not config:
+            config = ProfilerConfig(ranks=[], enable=False)
+        if not tool_config:
+            assert not config.enable, "tool_config must be set when profiler is enabled"
+        self.enable: bool = config.enable
+        if not config.enable:
+            return
+        self.this_step: bool = False
+        self.discrete: bool = tool_config.discrete
+        self.this_rank: bool = False
+        self.profile = None
+        self.profile_save_path = config.save_path
+        if config.all_ranks:
+            self.this_rank = True
+        elif config.ranks:
+            self.this_rank = rank in config.ranks
+
+    def start(self, **kwargs):
+        role, profile_step = kwargs.get("role", None), kwargs.get("profile_step", None)
+        profile_step = str(profile_step) if profile_step is not None else None
+        if self.enable and self.this_rank:
+            self.this_step = True
+            if not self.discrete and TorchProfiler._define_count == 0:
+                self.profile = get_torch_profiler(
+                    profile_save_path=self.profile_save_path,
+                    role=role,
+                    profile_step=profile_step,
+                )
+                self.profile.start()
+                TorchProfiler._define_count += 1
+
+    def stop(self):
+        if self.enable and self.this_rank:
+            self.this_step = False
+            if not self.discrete and TorchProfiler._define_count == 1:
+                self.profile.step()
+                self.profile.stop()
+                TorchProfiler._define_count -= 1
+
+    def annotate(self, message: Optional[str] = None, role: Optional[str] = None, **kwargs_outer) -> Callable:
+        """Decorate a Worker member function to profile the current rank in the current training step.
+
+        Requires the target function to be a member function of a Worker, which has a member field `profiler` with 
+        TorchProfiler type.
+
+        Args:
+            message (str, optional):
+                The message to be displayed in the profiler. Defaults to None.
+            role (str, optional):
+                The role of the current data collection. Defaults to None.
+        """
+
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs_inner):
+                if not self.enable:
+                    return func(*args, **kwargs_inner)
+
+                profile_name = message or func.__name__
+
+                if self.this_step:
+                    if self.discrete:
+                        profile = get_torch_profiler(
+                            profile_save_path=self.profile_save_path,
+                            role=role,
+                        )
+                        profile.start()
+                    mark_range = mark_start_range(message=profile_name)
+
+                result = func(*args, **kwargs_inner)
+
+                if self.this_step:
+                    mark_end_range(mark_range)
+                    if self.discrete:
+                        profile.step()
+                        profile.stop()
+
+                return result
+
+            return wrapper
+
+        return decorator
 
 
 class DistProfiler:
@@ -232,7 +258,7 @@ class DistProfiler:
             self._impl = _Npu(rank=rank, config=config, tool_config=tool_config, **kwargs)
         elif self._tool == "torch":
             # Use the torch profiler wrapper defined above
-            self._impl = Profiler(config=config, tool_config=tool_config)
+            self._impl = TorchProfiler(rank=rank, config=config, tool_config=tool_config)
         elif self._tool == "torch_memory":
             self._impl = TorchMemoryProfiler(rank=rank, config=config, tool_config=tool_config)
         else:
